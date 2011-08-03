@@ -1,3 +1,7 @@
+dnl openbsd in it's neverending brokenness requires stdint.h for intptr_t,
+dnl but that header isn't very portable...
+AC_CHECK_HEADERS([stdint.h])
+
 AC_SEARCH_LIBS(
    pthread_create,
    [pthread pthreads pthreadVC2],
@@ -118,6 +122,21 @@ int main (void)
 }
 ],ac_cv_sync_file_range=yes,ac_cv_sync_file_range=no)])
 test $ac_cv_sync_file_range = yes && AC_DEFINE(HAVE_SYNC_FILE_RANGE, 1, sync_file_range(2) is available)
+
+AC_CACHE_CHECK(for fallocate, ac_cv_fallocate, [AC_LINK_IFELSE([
+#include <fcntl.h>
+int main (void)
+{
+   int fd = 0;
+   int mode = 0;
+   off_t offset = 1;
+   off_t len = 1;
+   int res;
+   res = fallocate (fd, mode, offset, len);
+   return 0;
+}
+],ac_cv_fallocate=yes,ac_cv_fallocate=no)])
+test $ac_cv_fallocate = yes && AC_DEFINE(HAVE_FALLOCATE, 1, fallocate(2) is available)
 
 dnl #############################################################################
 dnl # these checks exist for the benefit of IO::AIO
