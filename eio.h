@@ -69,9 +69,13 @@ typedef int (*eio_cb)(eio_req *req);
 #ifdef _WIN32
   typedef int      eio_uid_t;
   typedef int      eio_gid_t;
-  typedef intptr_t eio_ssize_t; /* or SSIZE_T */
+  #ifdef __MINGW32__ /* no intptr_t */
+    typedef ssize_t  eio_ssize_t;
+  #else
+    typedef intptr_t eio_ssize_t; /* or SSIZE_T */
+  #endif
   #if __GNUC__
-    typedef long long eio_ino_t;
+    typedef long long eio_ino_t; /* signed for compatibility to msvc */
   #else
     typedef __int64   eio_ino_t; /* unsigned not supported by msvc */
   #endif
@@ -85,6 +89,16 @@ typedef int (*eio_cb)(eio_req *req);
 #ifndef EIO_STRUCT_STATVFS
 # define EIO_STRUCT_STATVFS struct statvfs
 #endif
+
+/* managing working directories */
+
+typedef struct eio_pwd *eio_wd;
+
+#define EIO_CWD 0 /* the current working directory of the process, guaranteed to be a null pointer */
+#define EIO_INVALID_WD ((eio_wd)(int)-1) /* failure return for eio_wd_open */
+
+eio_wd eio_wd_open_sync (eio_wd wd, const char *path);
+void eio_wd_close_sync (eio_wd wd);
 
 /* for readdir */
 
@@ -166,23 +180,36 @@ typedef double eio_tstamp;
 enum
 {
   EIO_CUSTOM,
-  EIO_OPEN, EIO_CLOSE, EIO_DUP2,
+  EIO_WD_OPEN, EIO_WD_CLOSE,
+
+  EIO_CLOSE, EIO_DUP2,
   EIO_READ, EIO_WRITE,
   EIO_READAHEAD, EIO_SENDFILE,
-  EIO_STAT, EIO_LSTAT, EIO_FSTAT,
-  EIO_STATVFS, EIO_FSTATVFS,
-  EIO_TRUNCATE, EIO_FTRUNCATE,
-  EIO_UTIME, EIO_FUTIME,
-  EIO_CHMOD, EIO_FCHMOD,
-  EIO_CHOWN, EIO_FCHOWN,
-  EIO_SYNC, EIO_FSYNC, EIO_FDATASYNC,
+  EIO_FSTAT, EIO_FSTATVFS,
+  EIO_FTRUNCATE, EIO_FUTIME, EIO_FCHMOD, EIO_FCHOWN,
+  EIO_SYNC, EIO_FSYNC, EIO_FDATASYNC, EIO_SYNCFS,
   EIO_MSYNC, EIO_MTOUCH, EIO_SYNC_FILE_RANGE, EIO_FALLOCATE,
   EIO_MLOCK, EIO_MLOCKALL,
-  EIO_UNLINK, EIO_RMDIR, EIO_MKDIR, EIO_RENAME,
-  EIO_MKNOD, EIO_READDIR,
-  EIO_LINK, EIO_SYMLINK, EIO_READLINK, EIO_REALPATH,
   EIO_GROUP, EIO_NOP,
-  EIO_BUSY
+  EIO_BUSY,
+
+  /* these use wd + ptr1, but are emulated */
+  EIO_REALPATH,
+  EIO_STATVFS,
+  EIO_READDIR,
+
+  /* all the following requests use wd + ptr1 as path in xxxat functions */
+  EIO_OPEN,
+  EIO_STAT, EIO_LSTAT,
+  EIO_TRUNCATE,
+  EIO_UTIME,
+  EIO_CHMOD,
+  EIO_CHOWN,
+  EIO_UNLINK, EIO_RMDIR, EIO_MKDIR, EIO_RENAME,
+  EIO_MKNOD,
+  EIO_LINK, EIO_SYMLINK, EIO_READLINK,
+
+  EIO_REQ_TYPE_NUM
 };
 
 /* mlockall constants */
@@ -207,6 +234,8 @@ struct eio_req
 {
   eio_req volatile *next; /* private ETP */
 
+  eio_wd wd;       /* all applicable requests: working directory of pathname, old name; wd_open: return wd */
+
   eio_ssize_t result;  /* result of syscall, e.g. result = read (... */
   off_t offs;      /* read, write, truncate, readahead, sync_file_range, fallocate: file offset, mknod: dev_t */
   size_t size;     /* read, write, readahead, sendfile, msync, mlock, sync_file_range, fallocate: length */
@@ -218,7 +247,7 @@ struct eio_req
   int type;        /* EIO_xxx constant ETP */
   int int1;        /* all applicable requests: file descriptor; sendfile: output fd; open, msync, mlockall, readdir: flags */
   long int2;       /* chown, fchown: uid; sendfile: input fd; open, chmod, mkdir, mknod: file mode, sync_file_range, fallocate: flags */
-  long int3;       /* chown, fchown: gid */
+  long int3;       /* chown, fchown: gid; rename, link: working directory of new name */
   int errorno;     /* errno value on syscall return */
 
 #if __i386 || __amd64
@@ -283,11 +312,14 @@ unsigned int eio_nthreads (void); /* number of worker threads in use currently *
 /* convenience wrappers */
 
 #ifndef EIO_NO_WRAPPERS
+eio_req *eio_wd_open   (const char *path, int pri, eio_cb cb, void *data); /* result=wd */
+eio_req *eio_wd_close  (eio_wd wd, int pri, eio_cb cb, void *data);
 eio_req *eio_nop       (int pri, eio_cb cb, void *data); /* does nothing except go through the whole process */
 eio_req *eio_busy      (eio_tstamp delay, int pri, eio_cb cb, void *data); /* ties a thread for this long, simulating busyness */
 eio_req *eio_sync      (int pri, eio_cb cb, void *data);
 eio_req *eio_fsync     (int fd, int pri, eio_cb cb, void *data);
 eio_req *eio_fdatasync (int fd, int pri, eio_cb cb, void *data);
+eio_req *eio_syncfs    (int fd, int pri, eio_cb cb, void *data);
 eio_req *eio_msync     (void *addr, size_t length, int flags, int pri, eio_cb cb, void *data);
 eio_req *eio_mtouch    (void *addr, size_t length, int flags, int pri, eio_cb cb, void *data);
 eio_req *eio_mlock     (void *addr, size_t length, int pri, eio_cb cb, void *data);
@@ -303,13 +335,13 @@ eio_req *eio_fstatvfs  (int fd, int pri, eio_cb cb, void *data); /* stat buffer=
 eio_req *eio_futime    (int fd, eio_tstamp atime, eio_tstamp mtime, int pri, eio_cb cb, void *data);
 eio_req *eio_ftruncate (int fd, off_t offset, int pri, eio_cb cb, void *data);
 eio_req *eio_fchmod    (int fd, mode_t mode, int pri, eio_cb cb, void *data);
-eio_req *eio_fchown    (int fd, uid_t uid, gid_t gid, int pri, eio_cb cb, void *data);
+eio_req *eio_fchown    (int fd, eio_uid_t uid, eio_gid_t gid, int pri, eio_cb cb, void *data);
 eio_req *eio_dup2      (int fd, int fd2, int pri, eio_cb cb, void *data);
 eio_req *eio_sendfile  (int out_fd, int in_fd, off_t in_offset, size_t length, int pri, eio_cb cb, void *data);
 eio_req *eio_open      (const char *path, int flags, mode_t mode, int pri, eio_cb cb, void *data);
 eio_req *eio_utime     (const char *path, eio_tstamp atime, eio_tstamp mtime, int pri, eio_cb cb, void *data);
 eio_req *eio_truncate  (const char *path, off_t offset, int pri, eio_cb cb, void *data);
-eio_req *eio_chown     (const char *path, uid_t uid, gid_t gid, int pri, eio_cb cb, void *data);
+eio_req *eio_chown     (const char *path, eio_uid_t uid, eio_gid_t gid, int pri, eio_cb cb, void *data);
 eio_req *eio_chmod     (const char *path, mode_t mode, int pri, eio_cb cb, void *data);
 eio_req *eio_mkdir     (const char *path, mode_t mode, int pri, eio_cb cb, void *data);
 eio_req *eio_readdir   (const char *path, int flags, int pri, eio_cb cb, void *data); /* result=ptr2 allocated dynamically */

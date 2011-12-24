@@ -45,7 +45,7 @@
 #include "ecb.h"
 
 #ifdef EIO_STACKSIZE
-# define XTHREAD_STACKSIZE EIO_STACKSIZE
+# define X_STACKSIZE EIO_STACKSIZE
 #endif
 #include "xthread.h"
 
@@ -71,6 +71,10 @@
 #endif
 #ifndef ELOOP
 # define ELOOP EDOM
+#endif
+
+#if !defined(ENOTSOCK) && defined(WSAENOTSOCK)
+# define ENOTSOCK WSAENOTSOCK
 #endif
 
 static void eio_destroy (eio_req *req);
@@ -103,9 +107,12 @@ static void eio_destroy (eio_req *req);
   #undef PAGESIZE
   #define PAGESIZE 4096 /* GetSystemInfo? */
 
+  /* TODO: look at how perl does stat (non-sloppy), unlink (ro-files), utime, link */
+
   #ifdef EIO_STRUCT_STATI64
+    /* look at perl's non-sloppy stat */
     #define stat(path,buf)       _stati64 (path,buf)
-    #define fstat(fd,buf)        _fstati64 (path,buf)
+    #define fstat(fd,buf)        _fstati64 (fd,buf)
   #endif
   #define lstat(path,buf)      stat (path,buf)
   #define fsync(fd)            (FlushFileBuffers ((HANDLE)EIO_FD_TO_WIN32_HANDLE (fd)) ? 0 : EIO_ERRNO (EBADF, -1))
@@ -126,6 +133,37 @@ static void eio_destroy (eio_req *req);
   #define readlink(path,buf,s) EIO_ENOSYS ()
   #define statvfs(path,buf)    EIO_ENOSYS ()
   #define fstatvfs(fd,buf)     EIO_ENOSYS ()
+
+  /* rename() uses MoveFile, which fails to overwrite */
+  #define rename(old,neu)      eio__rename (old, neu)
+
+  static int
+  eio__rename (const char *old, const char *neu)
+  {
+    if (MoveFileEx (old, neu, MOVEFILE_REPLACE_EXISTING))
+      return 0;
+
+    /* should steal _dosmaperr */
+    switch (GetLastError ())
+      {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_DRIVE:
+        case ERROR_NO_MORE_FILES:
+        case ERROR_BAD_NETPATH:
+        case ERROR_BAD_NET_NAME:
+        case ERROR_BAD_PATHNAME:
+        case ERROR_FILENAME_EXCED_RANGE:
+          errno = ENOENT;
+          break;
+
+        default:
+          errno = EACCES;
+          break;
+      }
+
+    return -1;
+  }
 
   /* we could even stat and see if it exists */
   static int
@@ -162,7 +200,6 @@ static void eio_destroy (eio_req *req);
   #include <sys/select.h>
   #include <sys/statvfs.h>
   #include <unistd.h>
-  #include <utime.h>
   #include <signal.h>
   #include <dirent.h>
 
@@ -194,6 +231,18 @@ static void eio_destroy (eio_req *req);
     #define EIO_STRUCT_DIRENT struct dirent
   #endif
 
+#endif
+
+#if HAVE_UTIMES
+# include <utime.h>
+#endif
+
+#if HAVE_SYS_SYSCALL_H
+# include <sys/syscall.h>
+#endif
+
+#if HAVE_SYS_PRCTL_H
+# include <sys/prctl.h>
 #endif
 
 #if HAVE_SENDFILE
@@ -245,6 +294,50 @@ static void eio_destroy (eio_req *req);
 
 #define EIO_TICKS ((1000000 + 1023) >> 10)
 
+/*****************************************************************************/
+
+struct tmpbuf
+{
+  void *ptr;
+  int len;
+};
+
+static void *
+tmpbuf_get (struct tmpbuf *buf, int len)
+{
+  if (buf->len < len)
+    {
+      free (buf->ptr);
+      buf->ptr = malloc (buf->len = len);
+    }
+
+  return buf->ptr;
+}
+
+struct tmpbuf;
+
+#if _POSIX_VERSION >= 200809L
+  #define HAVE_AT 1
+  #define WD2FD(wd) ((wd) ? (wd)->fd : AT_FDCWD)
+  #ifndef O_SEARCH
+    #define O_SEARCH O_RDONLY
+  #endif
+#else
+  #define HAVE_AT 0
+  static const char *wd_expand (struct tmpbuf *tmpbuf, eio_wd wd, const char *path);
+#endif
+
+struct eio_pwd
+{
+#if HAVE_AT
+  int fd;
+#endif
+  int len;
+  char str[1]; /* actually, a 0-terminated canonical path */
+};
+
+/*****************************************************************************/
+
 #define ETP_PRI_MIN EIO_PRI_MIN
 #define ETP_PRI_MAX EIO_PRI_MAX
 
@@ -277,11 +370,11 @@ static void (*done_poll_cb) (void);
 static unsigned int max_poll_time;     /* reslock */
 static unsigned int max_poll_reqs;     /* reslock */
 
-static volatile unsigned int nreqs;    /* reqlock */
-static volatile unsigned int nready;   /* reqlock */
-static volatile unsigned int npending; /* reqlock */
-static volatile unsigned int max_idle = 4;      /* maximum number of threads that can idle indefinitely */
-static volatile unsigned int idle_timeout = 10; /* number of seconds after which an idle threads exit */
+static unsigned int nreqs;    /* reqlock */
+static unsigned int nready;   /* reqlock */
+static unsigned int npending; /* reqlock */
+static unsigned int max_idle = 4;      /* maximum number of threads that can idle indefinitely */
+static unsigned int idle_timeout = 10; /* number of seconds after which an idle threads exit */
 
 static xmutex_t wrklock;
 static xmutex_t reslock;
@@ -299,13 +392,12 @@ static xmutex_t preadwritelock;
 
 typedef struct etp_worker
 {
+  struct tmpbuf tmpbuf;
+
   /* locked by wrklock */
   struct etp_worker *prev, *next;
 
   xthread_t tid;
-
-  /* locked by reslock, reqlock or wrklock */
-  ETP_REQ *req; /* currently processed request */
 
 #ifdef ETP_WORKER_COMMON
   ETP_WORKER_COMMON
@@ -319,7 +411,7 @@ static etp_worker wrk_first; /* NOT etp */
 
 /* worker threads management */
 
-static void ecb_cold
+static void
 etp_worker_clear (etp_worker *wrk)
 {
 }
@@ -327,6 +419,8 @@ etp_worker_clear (etp_worker *wrk)
 static void ecb_cold
 etp_worker_free (etp_worker *wrk)
 {
+  free (wrk->tmpbuf.ptr);
+
   wrk->next->prev = wrk->prev;
   wrk->prev->next = wrk->next;
 
@@ -514,7 +608,7 @@ etp_maybe_start_thread (void)
 static void ecb_cold
 etp_end_thread (void)
 {
-  eio_req *req = calloc (1, sizeof (eio_req));
+  eio_req *req = calloc (1, sizeof (eio_req)); /* will be freed by worker */
 
   req->type = -1;
   req->pri  = ETP_PRI_MAX - ETP_PRI_MIN;
@@ -932,6 +1026,24 @@ eio__futimes (int fd, const struct timeval tv[2])
 # define fdatasync(fd) fsync (fd)
 #endif
 
+static int
+eio__syncfs (int fd)
+{
+  int res;
+
+#if HAVE_SYS_SYNCFS
+  res = (int)syscall (__NR_syncfs, (int)(fd));
+#else
+  res = -1;
+  errno = ENOSYS;
+#endif
+
+  if (res < 0 && errno == ENOSYS && fd >= 0)
+    sync ();
+
+  return res;
+}
+
 /* sync_file_range always needs emulation */
 static int
 eio__sync_file_range (int fd, off_t offset, size_t nbytes, unsigned int flags)
@@ -1272,10 +1384,11 @@ eio__mtouch (eio_req *req)
 /*****************************************************************************/
 /* requests implemented outside eio_execute, because they are so large */
 
-static void
-eio__realpath (eio_req *req, etp_worker *self)
+/* result will always end up in tmpbuf, there is always space for adding a 0-byte */
+static int
+eio__realpath (struct tmpbuf *tmpbuf, eio_wd wd, const char *path)
 {
-  char *rel = req->ptr1;
+  const char *rel = path;
   char *res;
   char *tmp1, *tmp2;
 #if SYMLOOP_MAX > 32
@@ -1284,29 +1397,15 @@ eio__realpath (eio_req *req, etp_worker *self)
   int symlinks = 32;
 #endif
 
-  req->result = -1;
-
   errno = EINVAL;
   if (!rel)
-    return;
+    return -1;
 
   errno = ENOENT;
   if (!*rel)
-    return;
+    return -1;
 
-  if (!req->ptr2)
-    {
-      X_LOCK (wrklock);
-      req->flags |= EIO_FLAG_PTR2_FREE;
-      X_UNLOCK (wrklock);
-      req->ptr2 = malloc (PATH_MAX * 3);
-
-      errno = ENOMEM;
-      if (!req->ptr2)
-        return;
-    }
-
-  res  = req->ptr2;
+  res  = tmpbuf_get (tmpbuf, PATH_MAX * 3);
   tmp1 = res  + PATH_MAX;
   tmp2 = tmp1 + PATH_MAX;
 
@@ -1335,17 +1434,30 @@ eio__realpath (eio_req *req, etp_worker *self)
 
   if (*rel != '/')
     {
-      if (!getcwd (res, PATH_MAX))
-        return;
+      int len;
+
+      errno = ENOENT;
+      if (wd == EIO_INVALID_WD)
+        return -1;
+      
+      if (wd == EIO_CWD)
+        {
+          if (!getcwd (res, PATH_MAX))
+            return -1;
+
+          len = strlen (res);
+        }
+      else
+        memcpy (res, wd->str, len = wd->len);
 
       if (res [1]) /* only use if not / */
-        res += strlen (res);
+        res += len;
     }
 
   while (*rel)
     {
       eio_ssize_t len, linklen;
-      char *beg = rel;
+      const char *beg = rel;
 
       while (*rel && *rel != '/')
         ++rel;
@@ -1367,7 +1479,7 @@ eio__realpath (eio_req *req, etp_worker *self)
             {
               /* .. - back up one component, if possible */
 
-              while (res != req->ptr2)
+              while (res != tmpbuf->ptr)
                 if (*--res == '/')
                   break;
 
@@ -1387,12 +1499,12 @@ eio__realpath (eio_req *req, etp_worker *self)
         res [len + 1] = 0;
 
         /* now check if it's a symlink */
-        linklen = readlink (req->ptr2, tmp1, PATH_MAX);
+        linklen = readlink (tmpbuf->ptr, tmp1, PATH_MAX);
 
         if (linklen < 0)
           {
             if (errno != EINVAL)
-              return;
+              return -1;
 
             /* it's a normal directory. hopefully */
             res += len + 1;
@@ -1404,14 +1516,14 @@ eio__realpath (eio_req *req, etp_worker *self)
 
             errno = ENAMETOOLONG;
             if (linklen + 1 + rellen >= PATH_MAX)
-              return;
+              return -1;
 
             errno = ELOOP;
             if (!--symlinks)
-              return;
+              return -1;
 
             if (*tmp1 == '/')
-              res = req->ptr2; /* symlink resolves to an absolute path */
+              res = tmpbuf->ptr; /* symlink resolves to an absolute path */
 
             /* we need to be careful, as rel might point into tmp2 already */
             memmove (tmp2 + linklen + 1, rel, rellen + 1);
@@ -1423,13 +1535,10 @@ eio__realpath (eio_req *req, etp_worker *self)
     }
 
   /* special case for the lone root path */
-  if (res == req->ptr2)
+  if (res == tmpbuf->ptr)
     *res++ = '/';
 
-  req->result = res - (char *)req->ptr2;
-
-done:
-  req->ptr2 = realloc (req->ptr2, req->result); /* trade time for space savings */
+  return res - (char *)tmpbuf->ptr;
 }
 
 static signed char
@@ -1627,46 +1736,68 @@ eio__scandir (eio_req *req, etp_worker *self)
     int len = strlen ((const char *)req->ptr1);
     char *path = malloc (MAX_PATH);
     const char *fmt;
+    const char *reqpath = wd_expand (&self->tmpbuf, req->wd, req->ptr1);
 
     if (!len)
       fmt = "./*";
-    else if (((const char *)req->ptr1)[len - 1] == '/' || ((const char *)req->ptr1)[len - 1] == '\\')
+    else if (reqpath[len - 1] == '/' || reqpath[len - 1] == '\\')
       fmt = "%s*";
     else
       fmt = "%s/*";
 
-    _snprintf (path, MAX_PATH, fmt, (const char *)req->ptr1);
+    _snprintf (path, MAX_PATH, fmt, reqpath);
     dirp = FindFirstFile (path, &entp);
     free (path);
 
     if (dirp == INVALID_HANDLE_VALUE)
      {
-       dirp = 0;
+       /* should steal _dosmaperr */
+       switch (GetLastError ())
+         {
+           case ERROR_FILE_NOT_FOUND:
+             req->result = 0;
+             break;
 
-        switch (GetLastError ())
-          {
-            case ERROR_FILE_NOT_FOUND:
-              req->result = 0;
-              break;
+           case ERROR_INVALID_NAME:
+           case ERROR_PATH_NOT_FOUND:
+           case ERROR_NO_MORE_FILES:
+             errno = ENOENT;
+             break;
 
-            case ERROR_INVALID_NAME:
-            case ERROR_PATH_NOT_FOUND:
-            case ERROR_NO_MORE_FILES:
-              errno = ENOENT;
-              break;
+           case ERROR_NOT_ENOUGH_MEMORY:
+             errno = ENOMEM;
+             break;
 
-            case ERROR_NOT_ENOUGH_MEMORY:
-              errno = ENOMEM;
-              break;
+           default:
+             errno = EINVAL;
+             break;
+         }
 
-            default:
-              errno = EINVAL;
-              break;
-          }
+       return;
      }
   }
 #else
-  dirp = opendir (req->ptr1);
+  #if HAVE_AT
+    if (req->wd)
+      {
+        int fd = openat (WD2FD (req->wd), req->ptr1, O_CLOEXEC | O_SEARCH | O_DIRECTORY);
+
+        if (fd < 0)
+          return;
+
+        dirp = fdopendir (fd);
+
+        if (!dirp)
+          close (fd);
+      }
+    else
+      dirp = opendir (req->ptr1);
+  #else
+    dirp = opendir (wd_expand (&self->tmpbuf, req->wd, req->ptr1));
+  #endif
+
+  if (!dirp)
+    return;
 #endif
 
   if (req->flags & EIO_FLAG_PTR1_FREE)
@@ -1676,192 +1807,316 @@ eio__scandir (eio_req *req, etp_worker *self)
   req->ptr1 = dents = flags ? malloc (dentalloc * sizeof (eio_dirent)) : 0;
   req->ptr2 = names = malloc (namesalloc);
 
-  if (dirp && names && (!flags || dents))
-    for (;;)
-      {
-        int done;
+  if (!names || (flags && !dents))
+    return;
+
+  for (;;)
+    {
+      int done;
 
 #ifdef _WIN32
-        done = !dirp;
+      done = !dirp;
 #else
-        errno = 0;
-        entp = readdir (dirp);
-        done = !entp;
+      errno = 0;
+      entp = readdir (dirp);
+      done = !entp;
 #endif
 
-        if (done)
-          {
+      if (done)
+        {
 #ifndef _WIN32
-            int old_errno = errno;
-            closedir (dirp);
-            errno = old_errno;
+          int old_errno = errno;
+          closedir (dirp);
+          errno = old_errno;
 
-            if (errno)
-              break;
+          if (errno)
+            break;
 #endif
 
-            /* sort etc. */
-            req->int1   = flags;
-            req->result = dentoffs;
+          /* sort etc. */
+          req->int1   = flags;
+          req->result = dentoffs;
 
-            if (flags & EIO_READDIR_STAT_ORDER)
-              eio_dent_sort (dents, dentoffs, flags & EIO_READDIR_DIRS_FIRST ? 7 : 0, inode_bits);
-            else if (flags & EIO_READDIR_DIRS_FIRST)
-              if (flags & EIO_READDIR_FOUND_UNKNOWN)
-                eio_dent_sort (dents, dentoffs, 7, inode_bits); /* sort by score and inode */
-              else
-                {
-                  /* in this case, all is known, and we just put dirs first and sort them */
-                  eio_dirent *oth = dents + dentoffs;
-                  eio_dirent *dir = dents;
+          if (flags & EIO_READDIR_STAT_ORDER)
+            eio_dent_sort (dents, dentoffs, flags & EIO_READDIR_DIRS_FIRST ? 7 : 0, inode_bits);
+          else if (flags & EIO_READDIR_DIRS_FIRST)
+            if (flags & EIO_READDIR_FOUND_UNKNOWN)
+              eio_dent_sort (dents, dentoffs, 7, inode_bits); /* sort by score and inode */
+            else
+              {
+                /* in this case, all is known, and we just put dirs first and sort them */
+                eio_dirent *oth = dents + dentoffs;
+                eio_dirent *dir = dents;
 
-                  /* now partition dirs to the front, and non-dirs to the back */
-                  /* by walking from both sides and swapping if necessary */
-                  while (oth > dir)
-                    {
-                      if (dir->type == EIO_DT_DIR)
+                /* now partition dirs to the front, and non-dirs to the back */
+                /* by walking from both sides and swapping if necessary */
+                while (oth > dir)
+                  {
+                    if (dir->type == EIO_DT_DIR)
+                      ++dir;
+                    else if ((--oth)->type == EIO_DT_DIR)
+                      {
+                        eio_dirent tmp = *dir; *dir = *oth; *oth = tmp;
+
                         ++dir;
-                      else if ((--oth)->type == EIO_DT_DIR)
-                        {
-                          eio_dirent tmp = *dir; *dir = *oth; *oth = tmp;
+                      }
+                  }
 
-                          ++dir;
-                        }
-                    }
+                /* now sort the dirs only (dirs all have the same score) */
+                eio_dent_sort (dents, dir - dents, 0, inode_bits);
+              }
 
-                  /* now sort the dirs only (dirs all have the same score) */
-                  eio_dent_sort (dents, dir - dents, 0, inode_bits);
+          break;
+        }
+
+      /* now add the entry to our list(s) */
+      name = D_NAME (entp);
+
+      /* skip . and .. entries */
+      if (name [0] != '.' || (name [1] && (name [1] != '.' || name [2])))
+        {
+          int len = D_NAMLEN (entp) + 1;
+
+          while (ecb_expect_false (namesoffs + len > namesalloc))
+            {
+              namesalloc *= 2;
+              req->ptr2 = names = realloc (names, namesalloc);
+
+              if (!names)
+                break;
+            }
+
+          memcpy (names + namesoffs, name, len);
+
+          if (dents)
+            {
+              struct eio_dirent *ent;
+
+              if (ecb_expect_false (dentoffs == dentalloc))
+                {
+                  dentalloc *= 2;
+                  req->ptr1 = dents = realloc (dents, dentalloc * sizeof (eio_dirent));
+
+                  if (!dents)
+                    break;
                 }
 
-            break;
-          }
+              ent = dents + dentoffs;
 
-        /* now add the entry to our list(s) */
-        name = D_NAME (entp);
+              ent->nameofs = namesoffs; /* rather dirtily we store the offset in the pointer */
+              ent->namelen = len - 1;
+              ent->inode   = D_INO (entp);
 
-        /* skip . and .. entries */
-        if (name [0] != '.' || (name [1] && (name [1] != '.' || name [2])))
-          {
-            int len = D_NAMLEN (entp) + 1;
+              inode_bits |= ent->inode;
 
-            while (ecb_expect_false (namesoffs + len > namesalloc))
-              {
-                namesalloc *= 2;
-                req->ptr2 = names = realloc (names, namesalloc);
+              switch (D_TYPE (entp))
+                {
+                  default:
+                    ent->type = EIO_DT_UNKNOWN;
+                    flags |= EIO_READDIR_FOUND_UNKNOWN;
+                    break;
 
-                if (!names)
-                  break;
-              }
+                  #ifdef DT_FIFO
+                    case DT_FIFO: ent->type = EIO_DT_FIFO; break;
+                  #endif
+                  #ifdef DT_CHR
+                    case DT_CHR:  ent->type = EIO_DT_CHR;  break;
+                  #endif          
+                  #ifdef DT_MPC
+                    case DT_MPC:  ent->type = EIO_DT_MPC;  break;
+                  #endif          
+                  #ifdef DT_DIR
+                    case DT_DIR:  ent->type = EIO_DT_DIR;  break;
+                  #endif          
+                  #ifdef DT_NAM
+                    case DT_NAM:  ent->type = EIO_DT_NAM;  break;
+                  #endif          
+                  #ifdef DT_BLK
+                    case DT_BLK:  ent->type = EIO_DT_BLK;  break;
+                  #endif          
+                  #ifdef DT_MPB
+                    case DT_MPB:  ent->type = EIO_DT_MPB;  break;
+                  #endif          
+                  #ifdef DT_REG
+                    case DT_REG:  ent->type = EIO_DT_REG;  break;
+                  #endif          
+                  #ifdef DT_NWK
+                    case DT_NWK:  ent->type = EIO_DT_NWK;  break;
+                  #endif          
+                  #ifdef DT_CMP
+                    case DT_CMP:  ent->type = EIO_DT_CMP;  break;
+                  #endif          
+                  #ifdef DT_LNK
+                    case DT_LNK:  ent->type = EIO_DT_LNK;  break;
+                  #endif
+                  #ifdef DT_SOCK
+                    case DT_SOCK: ent->type = EIO_DT_SOCK; break;
+                  #endif
+                  #ifdef DT_DOOR
+                    case DT_DOOR: ent->type = EIO_DT_DOOR; break;
+                  #endif
+                  #ifdef DT_WHT
+                    case DT_WHT:  ent->type = EIO_DT_WHT;  break;
+                  #endif
+                }
 
-            memcpy (names + namesoffs, name, len);
+              ent->score = 7;
 
-            if (dents)
-              {
-                struct eio_dirent *ent;
+              if (flags & EIO_READDIR_DIRS_FIRST)
+                {
+                  if (ent->type == EIO_DT_UNKNOWN)
+                    {
+                      if (*name == '.') /* leading dots are likely directories, and, in any case, rare */
+                        ent->score = 1;
+                      else if (!strchr (name, '.')) /* absense of dots indicate likely dirs */
+                        ent->score = len <= 2 ? 4 - len : len <= 4 ? 4 : len <= 7 ? 5 : 6; /* shorter == more likely dir, but avoid too many classes */
+                    }
+                  else if (ent->type == EIO_DT_DIR)
+                    ent->score = 0;
+                }
+            }
 
-                if (ecb_expect_false (dentoffs == dentalloc))
-                  {
-                    dentalloc *= 2;
-                    req->ptr1 = dents = realloc (dents, dentalloc * sizeof (eio_dirent));
+          namesoffs += len;
+          ++dentoffs;
+        }
 
-                    if (!dents)
-                      break;
-                  }
-
-                ent = dents + dentoffs;
-
-                ent->nameofs = namesoffs; /* rather dirtily we store the offset in the pointer */
-                ent->namelen = len - 1;
-                ent->inode   = D_INO (entp);
-
-                inode_bits |= ent->inode;
-
-                switch (D_TYPE (entp))
-                  {
-                    default:
-                      ent->type = EIO_DT_UNKNOWN;
-                      flags |= EIO_READDIR_FOUND_UNKNOWN;
-                      break;
-
-                    #ifdef DT_FIFO
-                      case DT_FIFO: ent->type = EIO_DT_FIFO; break;
-                    #endif
-                    #ifdef DT_CHR
-                      case DT_CHR:  ent->type = EIO_DT_CHR;  break;
-                    #endif          
-                    #ifdef DT_MPC
-                      case DT_MPC:  ent->type = EIO_DT_MPC;  break;
-                    #endif          
-                    #ifdef DT_DIR
-                      case DT_DIR:  ent->type = EIO_DT_DIR;  break;
-                    #endif          
-                    #ifdef DT_NAM
-                      case DT_NAM:  ent->type = EIO_DT_NAM;  break;
-                    #endif          
-                    #ifdef DT_BLK
-                      case DT_BLK:  ent->type = EIO_DT_BLK;  break;
-                    #endif          
-                    #ifdef DT_MPB
-                      case DT_MPB:  ent->type = EIO_DT_MPB;  break;
-                    #endif          
-                    #ifdef DT_REG
-                      case DT_REG:  ent->type = EIO_DT_REG;  break;
-                    #endif          
-                    #ifdef DT_NWK
-                      case DT_NWK:  ent->type = EIO_DT_NWK;  break;
-                    #endif          
-                    #ifdef DT_CMP
-                      case DT_CMP:  ent->type = EIO_DT_CMP;  break;
-                    #endif          
-                    #ifdef DT_LNK
-                      case DT_LNK:  ent->type = EIO_DT_LNK;  break;
-                    #endif
-                    #ifdef DT_SOCK
-                      case DT_SOCK: ent->type = EIO_DT_SOCK; break;
-                    #endif
-                    #ifdef DT_DOOR
-                      case DT_DOOR: ent->type = EIO_DT_DOOR; break;
-                    #endif
-                    #ifdef DT_WHT
-                      case DT_WHT:  ent->type = EIO_DT_WHT;  break;
-                    #endif
-                  }
-
-                ent->score = 7;
-
-                if (flags & EIO_READDIR_DIRS_FIRST)
-                  {
-                    if (ent->type == EIO_DT_UNKNOWN)
-                      {
-                        if (*name == '.') /* leading dots are likely directories, and, in any case, rare */
-                          ent->score = 1;
-                        else if (!strchr (name, '.')) /* absense of dots indicate likely dirs */
-                          ent->score = len <= 2 ? 4 - len : len <= 4 ? 4 : len <= 7 ? 5 : 6; /* shorter == more likely dir, but avoid too many classes */
-                      }
-                    else if (ent->type == EIO_DT_DIR)
-                      ent->score = 0;
-                  }
-              }
-
-            namesoffs += len;
-            ++dentoffs;
-          }
-
-        if (EIO_CANCELLED (req))
-          {
-            errno = ECANCELED;
-            break;
-          }
+      if (EIO_CANCELLED (req))
+        {
+          errno = ECANCELED;
+          break;
+        }
 
 #ifdef _WIN32
-        if (!FindNextFile (dirp, &entp))
-          {
-            FindClose (dirp);
-            dirp = 0;
-          }
+      if (!FindNextFile (dirp, &entp))
+        {
+          FindClose (dirp);
+          dirp = 0;
+        }
 #endif
-      }
+    }
 }
+
+/*****************************************************************************/
+/* working directory stuff */
+/* various deficiencies in the posix 2008 api force us to */
+/* keep the absolute path in string form at all times */
+/* fuck yeah. */
+
+#if !HAVE_AT
+
+/* a bit like realpath, but usually faster because it doesn'T have to return */
+/* an absolute or canonical path */
+static const char *
+wd_expand (struct tmpbuf *tmpbuf, eio_wd wd, const char *path)
+{
+  if (!wd || *path == '/')
+    return path;
+
+  if (path [0] == '.' && !path [1])
+    return wd->str;
+
+  {
+    int l1 = wd->len;
+    int l2 = strlen (path);
+
+    char *res = tmpbuf_get (tmpbuf, l1 + l2 + 2);
+
+    memcpy (res, wd->str, l1);
+    res [l1] = '/';
+    memcpy (res + l1 + 1, path, l2 + 1);
+
+    return res;
+  }
+}
+
+#endif
+
+static eio_wd
+eio__wd_open_sync (struct tmpbuf *tmpbuf, eio_wd wd, const char *path)
+{
+  int fd;
+  eio_wd res;
+  int len = eio__realpath (tmpbuf, wd, path);
+
+  if (len < 0)
+    return EIO_INVALID_WD;
+
+#if HAVE_AT
+  fd = openat (WD2FD (wd), path, O_CLOEXEC | O_SEARCH | O_DIRECTORY);
+
+  if (fd < 0)
+    return EIO_INVALID_WD;
+#endif
+
+  res = malloc (sizeof (*res) + len); /* one extra 0-byte */
+
+#if HAVE_AT
+  res->fd = fd;
+#endif
+
+  res->len = len;
+  memcpy (res->str, tmpbuf->ptr, len);
+  res->str [len] = 0;
+
+  return res;
+}
+
+eio_wd
+eio_wd_open_sync (eio_wd wd, const char *path)
+{
+  struct tmpbuf tmpbuf = { 0 };
+  wd = eio__wd_open_sync (&tmpbuf, wd, path);
+  free (tmpbuf.ptr);
+
+  return wd;
+}
+
+void
+eio_wd_close_sync (eio_wd wd)
+{
+  if (wd != EIO_INVALID_WD && wd != EIO_CWD)
+    {
+      #if HAVE_AT
+      close (wd->fd);
+      #endif
+      free (wd);
+    }
+}
+
+#if HAVE_AT
+
+/* they forgot these */
+
+static int
+eio__truncateat (int dirfd, const char *path, off_t length)
+{
+  int fd = openat (dirfd, path, O_WRONLY | O_CLOEXEC);
+  int res;
+
+  if (fd < 0)
+    return fd;
+
+  res = ftruncate (fd, length);
+  close (fd);
+  return res;
+}
+
+static int
+eio__statvfsat (int dirfd, const char *path, struct statvfs *buf)
+{
+  int fd = openat (dirfd, path, O_SEARCH | O_CLOEXEC);
+  int res;
+
+  if (fd < 0)
+    return fd;
+
+  res = fstatvfs (fd, buf);
+  close (fd);
+  return res;
+
+}
+
+#endif
 
 /*****************************************************************************/
 
@@ -1880,11 +2135,30 @@ eio__scandir (eio_req *req, etp_worker *self)
         }					\
     }
 
+static void ecb_noinline ecb_cold
+etp_proc_init (void)
+{
+#if HAVE_PRCTL_SET_NAME
+  /* provide a more sensible "thread name" */
+  char name[16 + 1];
+  const int namelen = sizeof (name) - 1;
+  int len;
+
+  prctl (PR_GET_NAME, (unsigned long)name, 0, 0, 0);
+  name [namelen] = 0;
+  len = strlen (name);
+  strcpy (name + (len <= namelen - 4 ? len : namelen - 4), "/eio");
+  prctl (PR_SET_NAME, (unsigned long)name, 0, 0, 0);
+}
+#endif
+
 X_THREAD_PROC (etp_proc)
 {
   ETP_REQ *req;
   struct timespec ts;
   etp_worker *self = (etp_worker *)thr_arg;
+
+  etp_proc_init ();
 
   /* try to distribute timeouts somewhat evenly */
   ts.tv_nsec = ((unsigned long)self & 1023UL) * (1000000000UL / 1024UL);
@@ -1897,7 +2171,7 @@ X_THREAD_PROC (etp_proc)
 
       for (;;)
         {
-          self->req = req = reqq_shift (&req_queue);
+          req = reqq_shift (&req_queue);
 
           if (req)
             break;
@@ -1945,13 +2219,14 @@ X_THREAD_PROC (etp_proc)
       if (!reqq_push (&res_queue, req) && want_poll_cb)
         want_poll_cb ();
 
-      self->req = 0;
       etp_worker_clear (self);
 
       X_UNLOCK (reslock);
     }
 
 quit:
+  free (req);
+
   X_LOCK (wrklock);
   etp_worker_free (self);
   X_UNLOCK (wrklock);
@@ -2004,6 +2279,12 @@ eio_api_destroy (eio_req *req)
 static void
 eio_execute (etp_worker *self, eio_req *req)
 {
+#if HAVE_AT
+  int dirfd;
+#else
+  const char *path;
+#endif
+
   if (ecb_expect_false (EIO_CANCELLED (req)))
     {
       req->result  = -1;
@@ -2011,8 +2292,30 @@ eio_execute (etp_worker *self, eio_req *req)
       return;
     }
 
+  if (ecb_expect_false (req->wd == EIO_INVALID_WD))
+    {
+      req->result  = -1;
+      req->errorno = ENOENT;
+      return;
+    }
+
+  if (req->type >= EIO_OPEN)
+    {
+      #if HAVE_AT
+        dirfd = WD2FD (req->wd);
+      #else
+        path = wd_expand (&self->tmpbuf, req->wd, req->ptr1);
+      #endif
+    }
+
   switch (req->type)
     {
+      case EIO_WD_OPEN:   req->wd = eio__wd_open_sync (&self->tmpbuf, req->wd, req->ptr1);
+                          req->result = req->wd == EIO_INVALID_WD ? -1 : 0;
+                          break;
+      case EIO_WD_CLOSE:  req->result = 0;
+                          eio_wd_close_sync (req->wd); break;
+
       case EIO_READ:      ALLOC (req->size);
                           req->result = req->offs >= 0
                                       ? pread     (req->int1, req->ptr2, req->size, req->offs)
@@ -2024,49 +2327,129 @@ eio_execute (etp_worker *self, eio_req *req)
       case EIO_READAHEAD: req->result = readahead     (req->int1, req->offs, req->size); break;
       case EIO_SENDFILE:  req->result = eio__sendfile (req->int1, req->int2, req->offs, req->size); break;
 
+#if HAVE_AT
+
       case EIO_STAT:      ALLOC (sizeof (EIO_STRUCT_STAT));
-                          req->result = stat      (req->ptr1, (EIO_STRUCT_STAT *)req->ptr2); break;
+                          req->result = fstatat   (dirfd, req->ptr1, (EIO_STRUCT_STAT *)req->ptr2, 0); break;
       case EIO_LSTAT:     ALLOC (sizeof (EIO_STRUCT_STAT));
-                          req->result = lstat     (req->ptr1, (EIO_STRUCT_STAT *)req->ptr2); break;
+                          req->result = fstatat   (dirfd, req->ptr1, (EIO_STRUCT_STAT *)req->ptr2, AT_SYMLINK_NOFOLLOW); break;
+      case EIO_CHOWN:     req->result = fchownat  (dirfd, req->ptr1, req->int2, req->int3, 0); break;
+      case EIO_CHMOD:     req->result = fchmodat  (dirfd, req->ptr1, (mode_t)req->int2, 0); break;
+      case EIO_TRUNCATE:  req->result = eio__truncateat (dirfd, req->ptr1, req->offs); break;
+      case EIO_OPEN:      req->result = openat    (dirfd, req->ptr1, req->int1, (mode_t)req->int2); break;
+
+      case EIO_UNLINK:    req->result = unlinkat  (dirfd, req->ptr1, 0); break;
+      case EIO_RMDIR:     req->result = unlinkat  (dirfd, req->ptr1, AT_REMOVEDIR); break;
+      case EIO_MKDIR:     req->result = mkdirat   (dirfd, req->ptr1, (mode_t)req->int2); break;
+      case EIO_RENAME:    req->result = renameat  (dirfd, req->ptr1, WD2FD ((eio_wd)req->int3), req->ptr2); break;
+      case EIO_LINK:      req->result = linkat    (dirfd, req->ptr1, WD2FD ((eio_wd)req->int3), req->ptr2, 0); break;
+      case EIO_SYMLINK:   req->result = symlinkat (req->ptr1, dirfd, req->ptr2); break;
+      case EIO_MKNOD:     req->result = mknodat   (dirfd, req->ptr1, (mode_t)req->int2, (dev_t)req->offs); break;
+      case EIO_READLINK:  ALLOC (PATH_MAX);
+                          req->result = readlinkat (dirfd, req->ptr1, req->ptr2, PATH_MAX); break;
+      case EIO_STATVFS:   ALLOC (sizeof (EIO_STRUCT_STATVFS));
+                          req->result = eio__statvfsat (dirfd, req->ptr1, (EIO_STRUCT_STATVFS *)req->ptr2); break;
+      case EIO_UTIME:
+      case EIO_FUTIME:
+        {
+          struct timespec ts[2];
+          struct timespec *times;
+
+          if (req->nv1 != -1. || req->nv2 != -1.)
+            {
+              ts[0].tv_sec  = req->nv1;
+              ts[0].tv_nsec = (req->nv1 - ts[0].tv_sec) * 1e9;
+              ts[1].tv_sec  = req->nv2;
+              ts[1].tv_nsec = (req->nv2 - ts[1].tv_sec) * 1e9;
+
+              times = ts;
+            }
+          else
+            times = 0;
+
+          req->result = req->type == EIO_FUTIME
+                        ? futimens  (req->int1, times)
+                        : utimensat (dirfd, req->ptr1, times, 0);
+        }
+        break;
+
+#else
+
+      case EIO_STAT:      ALLOC (sizeof (EIO_STRUCT_STAT));
+                          req->result = stat      (path     , (EIO_STRUCT_STAT *)req->ptr2); break;
+      case EIO_LSTAT:     ALLOC (sizeof (EIO_STRUCT_STAT));
+                          req->result = lstat     (path     , (EIO_STRUCT_STAT *)req->ptr2); break;
+      case EIO_CHOWN:     req->result = chown     (path     , req->int2, req->int3); break;
+      case EIO_CHMOD:     req->result = chmod     (path     , (mode_t)req->int2); break;
+      case EIO_TRUNCATE:  req->result = truncate  (path     , req->offs); break;
+      case EIO_OPEN:      req->result = open      (path     , req->int1, (mode_t)req->int2); break;
+
+      case EIO_UNLINK:    req->result = unlink    (path     ); break;
+      case EIO_RMDIR:     req->result = rmdir     (path     ); break;
+      case EIO_MKDIR:     req->result = mkdir     (path     , (mode_t)req->int2); break;
+      case EIO_RENAME:    req->result = rename    (path     , req->ptr2); break;
+      case EIO_LINK:      req->result = link      (path     , req->ptr2); break;
+      case EIO_SYMLINK:   req->result = symlink   (path     , req->ptr2); break;
+      case EIO_MKNOD:     req->result = mknod     (path     , (mode_t)req->int2, (dev_t)req->offs); break;
+      case EIO_READLINK:  ALLOC (PATH_MAX);
+                          req->result = readlink  (path, req->ptr2, PATH_MAX); break;
+      case EIO_STATVFS:   ALLOC (sizeof (EIO_STRUCT_STATVFS));
+                          req->result = statvfs   (path     , (EIO_STRUCT_STATVFS *)req->ptr2); break;
+
+      case EIO_UTIME:
+      case EIO_FUTIME:
+        {
+          struct timeval tv[2];
+          struct timeval *times;
+
+          if (req->nv1 != -1. || req->nv2 != -1.)
+            {
+              tv[0].tv_sec  = req->nv1;
+              tv[0].tv_usec = (req->nv1 - tv[0].tv_sec) * 1e6;
+              tv[1].tv_sec  = req->nv2;
+              tv[1].tv_usec = (req->nv2 - tv[1].tv_sec) * 1e6;
+
+              times = tv;
+            }
+          else
+            times = 0;
+
+          req->result = req->type == EIO_FUTIME
+                        ? futimes (req->int1, times)
+                        : utimes  (req->ptr1, times);
+        }
+        break;
+
+#endif
+
+      case EIO_REALPATH:  if (0 <= (req->result = eio__realpath (&self->tmpbuf, req->wd, req->ptr1)))
+                            {
+                              ALLOC (req->result);
+                              memcpy (req->ptr2, self->tmpbuf.ptr, req->result);
+                            }
+                           break;
+
       case EIO_FSTAT:     ALLOC (sizeof (EIO_STRUCT_STAT));
                           req->result = fstat     (req->int1, (EIO_STRUCT_STAT *)req->ptr2); break;
 
-      case EIO_STATVFS:   ALLOC (sizeof (EIO_STRUCT_STATVFS));
-                          req->result = statvfs   (req->ptr1, (EIO_STRUCT_STATVFS *)req->ptr2); break;
       case EIO_FSTATVFS:  ALLOC (sizeof (EIO_STRUCT_STATVFS));
                           req->result = fstatvfs  (req->int1, (EIO_STRUCT_STATVFS *)req->ptr2); break;
 
-      case EIO_CHOWN:     req->result = chown     (req->ptr1, req->int2, req->int3); break;
       case EIO_FCHOWN:    req->result = fchown    (req->int1, req->int2, req->int3); break;
-      case EIO_CHMOD:     req->result = chmod     (req->ptr1, (mode_t)req->int2); break;
       case EIO_FCHMOD:    req->result = fchmod    (req->int1, (mode_t)req->int2); break;
-      case EIO_TRUNCATE:  req->result = truncate  (req->ptr1, req->offs); break;
       case EIO_FTRUNCATE: req->result = ftruncate (req->int1, req->offs); break;
 
-      case EIO_OPEN:      req->result = open      (req->ptr1, req->int1, (mode_t)req->int2); break;
       case EIO_CLOSE:     req->result = close     (req->int1); break;
       case EIO_DUP2:      req->result = dup2      (req->int1, req->int2); break;
-      case EIO_UNLINK:    req->result = unlink    (req->ptr1); break;
-      case EIO_RMDIR:     req->result = rmdir     (req->ptr1); break;
-      case EIO_MKDIR:     req->result = mkdir     (req->ptr1, (mode_t)req->int2); break;
-      case EIO_RENAME:    req->result = rename    (req->ptr1, req->ptr2); break;
-      case EIO_LINK:      req->result = link      (req->ptr1, req->ptr2); break;
-      case EIO_SYMLINK:   req->result = symlink   (req->ptr1, req->ptr2); break;
-      case EIO_MKNOD:     req->result = mknod     (req->ptr1, (mode_t)req->int2, (dev_t)req->offs); break;
-
-      case EIO_REALPATH:  eio__realpath (req, self); break;
-
-      case EIO_READLINK:  ALLOC (PATH_MAX);
-                          req->result = readlink  (req->ptr1, req->ptr2, PATH_MAX); break;
-
       case EIO_SYNC:      req->result = 0; sync (); break;
       case EIO_FSYNC:     req->result = fsync     (req->int1); break;
       case EIO_FDATASYNC: req->result = fdatasync (req->int1); break;
+      case EIO_SYNCFS:    req->result = eio__syncfs (req->int1); break;
+      case EIO_SYNC_FILE_RANGE: req->result = eio__sync_file_range (req->int1, req->offs, req->size, req->int2); break;
       case EIO_MSYNC:     req->result = eio__msync (req->ptr2, req->size, req->int1); break;
       case EIO_MTOUCH:    req->result = eio__mtouch (req); break;
       case EIO_MLOCK:     req->result = eio__mlock (req->ptr2, req->size); break;
       case EIO_MLOCKALL:  req->result = eio__mlockall (req->int1); break;
-      case EIO_SYNC_FILE_RANGE: req->result = eio__sync_file_range (req->int1, req->offs, req->size, req->int2); break;
       case EIO_FALLOCATE: req->result = eio__fallocate (req->int1, req->int2, req->offs, req->size); break;
 
       case EIO_READDIR:   eio__scandir (req, self); break;
@@ -2084,30 +2467,6 @@ eio_execute (etp_worker *self, eio_req *req)
           req->result = select (0, 0, 0, 0, &tv);
         }
 #endif
-        break;
-
-      case EIO_UTIME:
-      case EIO_FUTIME:
-        {
-          struct timeval tv[2];
-          struct timeval *times;
-
-          if (req->nv1 != -1. || req->nv2 != -1.)
-            {
-              tv[0].tv_sec  = req->nv1;
-              tv[0].tv_usec = (req->nv1 - tv[0].tv_sec) * 1000000.;
-              tv[1].tv_sec  = req->nv2;
-              tv[1].tv_usec = (req->nv2 - tv[1].tv_sec) * 1000000.;
-
-              times = tv;
-            }
-          else
-            times = 0;
-
-          req->result = req->type == EIO_FUTIME
-                        ? futimes (req->int1, times)
-                        : utimes  (req->ptr1, times);
-        }
         break;
 
       case EIO_GROUP:
@@ -2131,6 +2490,16 @@ eio_execute (etp_worker *self, eio_req *req)
 }
 
 #ifndef EIO_NO_WRAPPERS
+
+eio_req *eio_wd_open (const char *path, int pri, eio_cb cb, void *data)
+{
+  REQ (EIO_WD_OPEN); PATH; SEND;
+}
+
+eio_req *eio_wd_close (eio_wd wd, int pri, eio_cb cb, void *data)
+{
+  REQ (EIO_WD_CLOSE); req->wd = wd; SEND;
+}
 
 eio_req *eio_nop (int pri, eio_cb cb, void *data)
 {
@@ -2157,6 +2526,21 @@ eio_req *eio_msync (void *addr, size_t length, int flags, int pri, eio_cb cb, vo
   REQ (EIO_MSYNC); req->ptr2 = addr; req->size = length; req->int1 = flags; SEND;
 }
 
+eio_req *eio_fdatasync (int fd, int pri, eio_cb cb, void *data)
+{
+  REQ (EIO_FDATASYNC); req->int1 = fd; SEND;
+}
+
+eio_req *eio_syncfs (int fd, int pri, eio_cb cb, void *data)
+{
+  REQ (EIO_SYNCFS); req->int1 = fd; SEND;
+}
+
+eio_req *eio_sync_file_range (int fd, off_t offset, size_t nbytes, unsigned int flags, int pri, eio_cb cb, void *data)
+{
+  REQ (EIO_SYNC_FILE_RANGE); req->int1 = fd; req->offs = offset; req->size = nbytes; req->int2 = flags; SEND;
+}
+
 eio_req *eio_mtouch (void *addr, size_t length, int flags, int pri, eio_cb cb, void *data)
 {
   REQ (EIO_MTOUCH); req->ptr2 = addr; req->size = length; req->int1 = flags; SEND;
@@ -2172,19 +2556,9 @@ eio_req *eio_mlockall (int flags, int pri, eio_cb cb, void *data)
   REQ (EIO_MLOCKALL); req->int1 = flags; SEND;
 }
 
-eio_req *eio_sync_file_range (int fd, off_t offset, size_t nbytes, unsigned int flags, int pri, eio_cb cb, void *data)
-{
-  REQ (EIO_SYNC_FILE_RANGE); req->int1 = fd; req->offs = offset; req->size = nbytes; req->int2 = flags; SEND;
-}
-
 eio_req *eio_fallocate (int fd, int mode, off_t offset, size_t len, int pri, eio_cb cb, void *data)
 {
   REQ (EIO_FALLOCATE); req->int1 = fd; req->int2 = mode; req->offs = offset; req->size = len; SEND;
-}
-
-eio_req *eio_fdatasync (int fd, int pri, eio_cb cb, void *data)
-{
-  REQ (EIO_FDATASYNC); req->int1 = fd; SEND;
 }
 
 eio_req *eio_close (int fd, int pri, eio_cb cb, void *data)

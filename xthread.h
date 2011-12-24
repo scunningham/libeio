@@ -16,7 +16,6 @@
 /////////////////////////////////////////////////////////////////////////////
 
 #ifdef _WIN32
-typedef int ssize_t;
 
 #define NTDDI_VERSION NTDDI_WIN2K // needed to get win2000 api calls
 #define _WIN32_WINNT 0x400
@@ -33,7 +32,6 @@ typedef int ssize_t;
 #define pthread_sigmask(a,b,c)
 #define sigaddset(a,b)
 #define sigemptyset(s)
-#define sigfillset(s)
 
 typedef pthread_mutex_t xmutex_t;
 #define X_MUTEX_INIT           PTHREAD_MUTEX_INITIALIZER

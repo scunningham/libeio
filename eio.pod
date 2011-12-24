@@ -235,13 +235,17 @@ The C<void *data> member simply stores the value of the C<data> argument.
 
 =back
 
+Members not explicitly described as accessible must not be
+accessed. Specifically, there is no guarantee that any members will still
+have the value they had when the request was submitted.
+
 The return value of the callback is normally C<0>, which tells libeio to
 continue normally. If a callback returns a nonzero value, libeio will
 stop processing results (in C<eio_poll>) and will return the value to its
 caller.
 
-Memory areas passed to libeio must stay valid as long as a request
-executes, with the exception of paths, which are being copied
+Memory areas passed to libeio wrappers must stay valid as long as a
+request executes, with the exception of paths, which are being copied
 internally. Any memory libeio itself allocates will be freed after the
 finish callback has been called. If you want to manage all memory passed
 to libeio yourself you can use the low-level API.
@@ -593,6 +597,13 @@ use.
 
 Calls C<readahead(2)>. If the syscall is missing, then the call is
 emulated by simply reading the data (currently in 64kiB chunks).
+
+=item eio_syncfs (int fd, int pri, eio_cb cb, void *data)
+
+Calls Linux' C<syncfs> syscall, if available. Returns C<-1> and sets
+C<errno> to C<ENOSYS> if the call is missing I<but still calls sync()>,
+if the C<fd> is C<< >= 0 >>, so you can probe for the availability of the
+syscall with a negative C<fd> argument and checking for C<-1/ENOSYS>.
 
 =item eio_sync_file_range (int fd, off_t offset, size_t nbytes, unsigned int flags, int pri, eio_cb cb, void *data)
 
