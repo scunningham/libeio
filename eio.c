@@ -2149,8 +2149,8 @@ etp_proc_init (void)
   len = strlen (name);
   strcpy (name + (len <= namelen - 4 ? len : namelen - 4), "/eio");
   prctl (PR_SET_NAME, (unsigned long)name, 0, 0, 0);
-}
 #endif
+}
 
 X_THREAD_PROC (etp_proc)
 {
