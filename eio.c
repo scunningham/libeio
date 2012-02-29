@@ -1489,7 +1489,7 @@ eio__realpath (struct tmpbuf *tmpbuf, eio_wd wd, const char *path)
 
         errno = ENAMETOOLONG;
         if (res + 1 + len + 1 >= tmp1)
-          return;
+          return -1;
 
         /* copy one component */
         *res = '/';
@@ -1968,7 +1968,7 @@ eio__scandir (eio_req *req, etp_worker *self)
                     {
                       if (*name == '.') /* leading dots are likely directories, and, in any case, rare */
                         ent->score = 1;
-                      else if (!strchr (name, '.')) /* absense of dots indicate likely dirs */
+                      else if (!strchr (name, '.')) /* absence of dots indicate likely dirs */
                         ent->score = len <= 2 ? 4 - len : len <= 4 ? 4 : len <= 7 ? 5 : 6; /* shorter == more likely dir, but avoid too many classes */
                     }
                   else if (ent->type == EIO_DT_DIR)
