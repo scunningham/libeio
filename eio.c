@@ -1034,8 +1034,7 @@ eio__syncfs (int fd)
 #if HAVE_SYS_SYNCFS
   res = (int)syscall (__NR_syncfs, (int)(fd));
 #else
-  res = -1;
-  errno = ENOSYS;
+  res = EIO_ENOSYS ();
 #endif
 
   if (res < 0 && errno == ENOSYS && fd >= 0)
@@ -1075,11 +1074,10 @@ eio__sync_file_range (int fd, off_t offset, size_t nbytes, unsigned int flags)
 static int
 eio__fallocate (int fd, int mode, off_t offset, size_t len)
 {
-#if HAVE_FALLOCATE
+#if HAVE_LINUX_FALLOCATE
   return fallocate (fd, mode, offset, len);
 #else
-  errno = ENOSYS;
-  return -1;
+  return EIO_ENOSYS ();
 #endif
 }
 
@@ -1188,8 +1186,7 @@ eio__sendfile (int ofd, int ifd, off_t offset, size_t count)
       res = TransmitFile (TO_SOCKET (ofd), h, count, 0, 0, 0, 0);
 
 #else
-      res = -1;
-      errno = ENOSYS;
+      res = EIO_ENOSYS ();
 #endif
 
       /* we assume sendfile can copy at least 128mb in one go */
@@ -2497,8 +2494,7 @@ eio_execute (etp_worker *self, eio_req *req)
         break;
 
       default:
-        errno = ENOSYS;
-        req->result = -1;
+        req->result = EIO_ENOSYS ();
         break;
     }
 
