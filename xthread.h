@@ -47,11 +47,11 @@ typedef pthread_cond_t xcond_t;
 #define X_COND_TIMEDWAIT(cond,mutex,to) pthread_cond_timedwait (&(cond), &(mutex), &(to))
 
 typedef pthread_t xthread_t;
-#define X_THREAD_PROC(name) void *name (void *thr_arg)
+#define X_THREAD_PROC(name) static void *name (void *thr_arg)
 #define X_THREAD_ATFORK(a,b,c)
 
 static int
-thread_create (xthread_t *tid, void *(*proc)(void *), void *arg)
+xthread_create (xthread_t *tid, void *(*proc)(void *), void *arg)
 {
   int retval;
   pthread_attr_t attr;
@@ -132,7 +132,7 @@ typedef pthread_t xthread_t;
 #endif
 
 static int
-thread_create (xthread_t *tid, void *(*proc)(void *), void *arg)
+xthread_create (xthread_t *tid, void *(*proc)(void *), void *arg)
 {
   int retval;
   sigset_t fullsigset, oldsigset;
